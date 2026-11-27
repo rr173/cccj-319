@@ -1,0 +1,424 @@
+"""FastAPI 应用：多团队工单承诺时限。"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+from contextlib import asynccontextmanager
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
+
+from . import db, service, timeutil
+
+# --------------------------------------------------------------------------
+# 请求模型
+# --------------------------------------------------------------------------
+
+
+class TeamIn(BaseModel):
+    name: str = Field(min_length=1)
+    response_budget_min: int = Field(default=60, ge=0)
+    resolution_budget_min: int = Field(default=480, ge=0)
+
+
+class TeamBudgetIn(BaseModel):
+    response_budget_min: int | None = Field(default=None, ge=0)
+    resolution_budget_min: int | None = Field(default=None, ge=0)
+
+
+class TicketIn(BaseModel):
+    title: str = Field(min_length=1)
+    team_id: int
+    response_budget_min: int | None = Field(default=None, ge=0)
+    resolution_budget_min: int | None = Field(default=None, ge=0)
+    accept: bool = True          # 登记即受理；false 则先登记，稍后受理
+    at: str | None = None
+    actor: str = "agent"
+
+
+class AcceptIn(BaseModel):
+    actor: str = "agent"
+    at: str | None = None
+
+
+class CalendarIn(BaseModel):
+    team_id: int
+    day: str
+    intervals: list[Any]
+    actor: str = "duty"
+
+    @field_validator("intervals")
+    @classmethod
+    def _non_empty(cls, v):
+        return v
+
+
+class NoteIn(BaseModel):
+    actor: str = "agent"
+    content: str = ""
+    at: str | None = None
+
+
+class ReplyIn(BaseModel):
+    actor: str = "agent"
+    content: str | None = None
+    useful: bool = True
+    customer: bool = False
+    at: str | None = None
+
+
+class CustomerReplyIn(BaseModel):
+    actor: str = "customer"
+    content: str | None = None
+    at: str | None = None
+
+
+class WaitIn(BaseModel):
+    actor: str = "agent"
+    reason: str | None = None
+    at: str | None = None
+
+
+class ResolveIn(BaseModel):
+    actor: str = "agent"
+    at: str | None = None
+
+
+class TransferIn(BaseModel):
+    to_team_id: int
+    actor: str = "agent"
+    at: str | None = None
+
+
+class AckIn(BaseModel):
+    actor: str = "agent"
+    note: str | None = None
+
+
+class ClockIn(BaseModel):
+    at: str
+    actor: str = "duty"
+
+
+def _at(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return timeutil.parse_iso(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="时间格式应为 ISO-8601，例如 2026-01-01T09:00:00Z") from exc
+
+
+# --------------------------------------------------------------------------
+# 应用工厂
+# --------------------------------------------------------------------------
+
+
+def create_app(db_path: str | None = None) -> FastAPI:
+    path = db_path or os.environ.get("TICKET_DB") or os.path.join(tempfile.gettempdir(), "tickets.db")
+    bootstrap = db.connect(path)
+    db.init_db(bootstrap)
+    bootstrap.close()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+
+    app = FastAPI(title="承诺时限后端", version="1.0.0", lifespan=lifespan)
+    app.state.db_path = path
+
+    def get_conn():
+        return db.connect(app.state.db_path)
+
+    @app.exception_handler(service.Conflict)
+    async def _conflict(request: Request, exc: service.Conflict):
+        return JSONResponse(status_code=409, content={"detail": exc.message, **exc.detail})
+
+    @app.exception_handler(service.NotFound)
+    async def _not_found(request: Request, exc: service.NotFound):
+        return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    # ---------------- 团队与日历 ----------------
+
+    @app.post("/teams", status_code=201)
+    def create_team(body: TeamIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                team = service.create_team(
+                    conn, body.name, body.response_budget_min, body.resolution_budget_min
+                )
+            return team
+        finally:
+            conn.close()
+
+    @app.get("/teams")
+    def list_teams():
+        conn = get_conn()
+        try:
+            return [dict(r) for r in conn.execute("SELECT * FROM teams ORDER BY id")]
+        finally:
+            conn.close()
+
+    @app.patch("/teams/{team_id}")
+    def patch_team(team_id: int, body: TeamBudgetIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                return service.update_team_budgets(
+                    conn, team_id, body.response_budget_min, body.resolution_budget_min
+                )
+        finally:
+            conn.close()
+
+    @app.put("/teams/{team_id}/calendar/{day}")
+    def put_calendar(team_id: int, day: str, body: CalendarIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                result = service.set_team_calendar(
+                    conn, team_id, day, body.intervals, body.actor, now
+                )
+            return result
+        finally:
+            conn.close()
+
+    @app.get("/teams/{team_id}/calendar/{day}")
+    def get_calendar(team_id: int, day: str):
+        conn = get_conn()
+        try:
+            service.get_team(conn, team_id)
+            return {"team_id": team_id, "day": day, "intervals": service.day_calendar(conn, team_id, day)}
+        finally:
+            conn.close()
+
+    @app.get("/teams/{team_id}/corrections")
+    def list_corrections(team_id: int):
+        conn = get_conn()
+        try:
+            service.get_team(conn, team_id)
+            rows = conn.execute(
+                "SELECT * FROM calendar_corrections WHERE team_id = ? ORDER BY id", (team_id,)
+            ).fetchall()
+            import json as _json
+
+            return [
+                {
+                    "id": r["id"],
+                    "day": r["day"],
+                    "before": _json.loads(r["before_json"]),
+                    "after": _json.loads(r["after_json"]),
+                    "actor": r["actor"],
+                    "created_at": timeutil.iso(r["created_at"]),
+                }
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    # ---------------- 时钟 ----------------
+
+    @app.get("/clock")
+    def get_clock():
+        conn = get_conn()
+        try:
+            return service.clock_info(conn)
+        finally:
+            conn.close()
+
+    @app.post("/clock")
+    def set_clock(body: ClockIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                at = service.set_clock(conn, _at(body.at), body.actor)
+                service.reevaluate_open_tickets(conn, at)
+            return service.clock_info(conn)
+        finally:
+            conn.close()
+
+    # ---------------- 工单 ----------------
+
+    @app.post("/tickets", status_code=201)
+    def create_ticket(body: TicketIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                at = now if body.at is None else _at(body.at)
+                if at > now:
+                    raise service.Conflict("登记时刻不能晚于当前时刻")
+                ticket_id = service.create_ticket(
+                    conn,
+                    body.title,
+                    body.team_id,
+                    at,
+                    body.actor,
+                    body.response_budget_min,
+                    body.resolution_budget_min,
+                    body.accept,
+                )
+            return service.ticket_detail(conn, ticket_id)
+        finally:
+            conn.close()
+
+    @app.post("/tickets/{ticket_id}/accept")
+    def accept(ticket_id: int, body: AcceptIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                service.accept_ticket(conn, ticket_id, body.actor, _at(body.at), now)
+            return service.ticket_detail(conn, ticket_id)
+        finally:
+            conn.close()
+
+    @app.get("/tickets")
+    def list_tickets(status: str | None = None, team_id: int | None = None):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                service.reevaluate_open_tickets(conn, now)
+            return service.list_tickets(conn, status, team_id)
+        finally:
+            conn.close()
+
+    @app.get("/tickets/{ticket_id}")
+    def get_ticket(ticket_id: int):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                service.evaluate_ticket(conn, ticket_id, now)
+            return service.ticket_detail(conn, ticket_id)
+        finally:
+            conn.close()
+
+    @app.get("/tickets/{ticket_id}/events")
+    def get_events(ticket_id: int):
+        conn = get_conn()
+        try:
+            service.ticket_detail(conn, ticket_id)
+            return service.list_events(conn, ticket_id)
+        finally:
+            conn.close()
+
+    @app.post("/tickets/{ticket_id}/notes")
+    def add_note(ticket_id: int, body: NoteIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                service.add_note(conn, ticket_id, body.actor, body.content, _at(body.at), now)
+            return service.ticket_detail(conn, ticket_id)
+        finally:
+            conn.close()
+
+    @app.post("/tickets/{ticket_id}/replies")
+    def add_reply(ticket_id: int, body: ReplyIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                at = _at(body.at)
+                if body.customer:
+                    service.add_customer_reply(conn, ticket_id, body.actor, body.content, at, now)
+                else:
+                    service.add_agent_reply(
+                        conn, ticket_id, body.actor, body.useful, body.content, at, now
+                    )
+            return service.ticket_detail(conn, ticket_id)
+        finally:
+            conn.close()
+
+    @app.post("/tickets/{ticket_id}/customer-replies")
+    def add_customer_reply(ticket_id: int, body: CustomerReplyIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                service.add_customer_reply(conn, ticket_id, body.actor, body.content, _at(body.at), now)
+            return service.ticket_detail(conn, ticket_id)
+        finally:
+            conn.close()
+
+    @app.post("/tickets/{ticket_id}/waits")
+    def request_wait(ticket_id: int, body: WaitIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                service.request_customer_info(
+                    conn, ticket_id, body.actor, body.reason, _at(body.at), now
+                )
+            return service.ticket_detail(conn, ticket_id)
+        finally:
+            conn.close()
+
+    @app.post("/tickets/{ticket_id}/resolve")
+    def resolve(ticket_id: int, body: ResolveIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                service.resolve_ticket(conn, ticket_id, body.actor, _at(body.at), now)
+            return service.ticket_detail(conn, ticket_id)
+        finally:
+            conn.close()
+
+    @app.post("/tickets/{ticket_id}/transfer")
+    def transfer(ticket_id: int, body: TransferIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                service.transfer_ticket(
+                    conn, ticket_id, body.to_team_id, body.actor, _at(body.at), now
+                )
+            return service.ticket_detail(conn, ticket_id)
+        finally:
+            conn.close()
+
+    # ---------------- 升级 ----------------
+
+    @app.get("/escalations")
+    def list_escalations(ticket_id: int | None = None, status: str | None = None):
+        conn = get_conn()
+        try:
+            return service.list_escalations(conn, ticket_id, status)
+        finally:
+            conn.close()
+
+    @app.get("/escalations/{escalation_id}")
+    def get_escalation(escalation_id: int):
+        conn = get_conn()
+        try:
+            return service.get_escalation(conn, escalation_id)
+        finally:
+            conn.close()
+
+    @app.post("/escalations/{escalation_id}/acknowledge")
+    def acknowledge(escalation_id: int, body: AckIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                result = service.acknowledge_escalation(conn, escalation_id, body.actor, body.note, now)
+            return result
+        finally:
+            conn.close()
+
+    @app.get("/health")
+    def health():
+        return {"ok": True}
+
+    return app
+
+
+# 供 uvicorn 直接使用
+app = create_app()
