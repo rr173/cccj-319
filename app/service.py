@@ -282,6 +282,9 @@ def resolve_ticket(conn, ticket_id: int, actor: str, at: int | None, now: int) -
         raise Conflict("工单尚未受理")
     at = now if at is None else at
     _validate_event_time(t, at, now, conn)
+    # 回拨联动：未开始且未过期的预约随结案取消；已开始未结束则拒绝结案。
+    from . import callbacks as cbmod
+    cbmod.before_resolve(conn, ticket_id, now)
     conn.execute("UPDATE tickets SET status = 'resolved', resolved_at = ? WHERE id = ?", (at, ticket_id))
     # 结案时关闭仍在进行的等待（客户始终没回，但工单已结束）。
     conn.execute(
@@ -312,6 +315,10 @@ def transfer_ticket(conn, ticket_id: int, to_team_id: int, actor: str, at: int |
             "转组时刻不能早于上一次转组",
             detail={"last_transfer_at": timeutil.iso(last)},
         )
+    # 回拨联动：未开始预约随窗口/技能由目标组承接，安排不下则不转组；
+    # 已开始未结束的回拨直接拒绝转组。
+    from . import callbacks as cbmod
+    cbmod.before_transfer(conn, ticket_id, to_team_id, now)
     conn.execute(
         "INSERT INTO ticket_transfers (ticket_id, from_team_id, to_team_id, at) VALUES (?, ?, ?, ?)",
         (ticket_id, t["current_team_id"], to_team_id, at),
@@ -690,6 +697,12 @@ def _ticket_detail_from_row(conn, t: dict) -> dict:
         ).fetchall()
     ]
 
+    from . import callbacks as cbmod
+    callbacks_list = cbmod.callbacks_for_ticket(conn, ticket_id)
+    active_callback = next(
+        (c for c in reversed(callbacks_list) if c["status"] in cbmod.ACTIVE_STATUSES), None
+    )
+
     def latest(dim: str) -> dict | None:
         items = [e for e in escalations if e["dimension"] == dim]
         return items[-1] if items else None
@@ -727,6 +740,8 @@ def _ticket_detail_from_row(conn, t: dict) -> dict:
             }
             for r in waits
         ],
+        "active_callback": active_callback,
+        "callbacks": callbacks_list,
     }
 
 

@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+from . import callbacks as cbmod
 from . import db, service, timeutil
 
 # --------------------------------------------------------------------------
@@ -101,6 +102,55 @@ class AckIn(BaseModel):
 class ClockIn(BaseModel):
     at: str
     actor: str = "duty"
+
+
+# --------------------------------------------------------------------------
+# 回拨预约请求模型
+# --------------------------------------------------------------------------
+
+
+class AgentIn(BaseModel):
+    name: str = Field(min_length=1)
+    team_id: int
+    skills: list[str]
+    availability: list[Any]
+
+
+class AgentPatchIn(BaseModel):
+    name: str | None = None
+    team_id: int | None = None
+    skills: list[str] | None = None
+    availability: list[Any] | None = None
+
+
+class CallbackBookIn(BaseModel):
+    skill: str = Field(min_length=1)
+    start: Any
+    end: Any
+    actor: str = "agent"
+    agent_id: int | None = None
+
+
+class CallbackRescheduleIn(BaseModel):
+    start: Any
+    end: Any
+    actor: str = "agent"
+
+
+class CallbackCancelIn(BaseModel):
+    actor: str = "agent"
+    reason: str | None = None
+
+
+class CallbackStartIn(BaseModel):
+    agent_id: int
+    actor: str = "agent"
+    at: str | None = None
+
+
+class CallbackEndIn(BaseModel):
+    actor: str = "agent"
+    at: str | None = None
 
 
 def _at(value: str | None) -> int | None:
@@ -237,6 +287,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
             with db.transaction(conn):
                 at = service.set_clock(conn, _at(body.at), body.actor)
                 service.reevaluate_open_tickets(conn, at)
+                # 回拨高水位只增不减：时钟推进可能使未开始预约错过，时钟回放不复活。
+                conn.execute(
+                    "INSERT INTO callback_clock (id, high_water_minute) VALUES (1, ?)"
+                    " ON CONFLICT(id) DO UPDATE SET high_water_minute ="
+                    " MAX(high_water_minute, excluded.high_water_minute)",
+                    (at,),
+                )
+                cbmod.sweep_missed(conn, cbmod.business_now(conn))
             return service.clock_info(conn)
         finally:
             conn.close()
@@ -284,6 +342,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             with db.transaction(conn):
                 now = service.now_minute(conn)
                 service.reevaluate_open_tickets(conn, now)
+                cbmod.sweep_missed(conn, cbmod.business_now(conn))
             return service.list_tickets(conn, status, team_id)
         finally:
             conn.close()
@@ -295,6 +354,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             with db.transaction(conn):
                 now = service.now_minute(conn)
                 service.evaluate_ticket(conn, ticket_id, now)
+                cbmod.sweep_missed(conn, cbmod.business_now(conn))
             return service.ticket_detail(conn, ticket_id)
         finally:
             conn.close()
@@ -409,6 +469,159 @@ def create_app(db_path: str | None = None) -> FastAPI:
             with db.transaction(conn):
                 now = service.now_minute(conn)
                 result = service.acknowledge_escalation(conn, escalation_id, body.actor, body.note, now)
+            return result
+        finally:
+            conn.close()
+
+    # ---------------- 回拨：坐席档案 ----------------
+
+    @app.post("/agents", status_code=201)
+    def create_agent(body: AgentIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = cbmod.business_now(conn)
+                cbmod.sweep_missed(conn, now)
+                agent = cbmod.create_agent(
+                    conn, body.name, body.team_id, body.skills, body.availability, now
+                )
+            return agent
+        finally:
+            conn.close()
+
+    @app.get("/agents")
+    def list_agents(team_id: int | None = None):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = cbmod.business_now(conn)
+                cbmod.sweep_missed(conn, now)
+                return cbmod.list_agents(conn, team_id)
+        finally:
+            conn.close()
+
+    @app.get("/agents/{agent_id}")
+    def get_agent(agent_id: int):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = cbmod.business_now(conn)
+                cbmod.sweep_missed(conn, now)
+                return cbmod.agent_detail(conn, agent_id)
+        finally:
+            conn.close()
+
+    @app.patch("/agents/{agent_id}")
+    def patch_agent(agent_id: int, body: AgentPatchIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = cbmod.business_now(conn)
+                cbmod.sweep_missed(conn, now)
+                return cbmod.update_agent(
+                    conn, agent_id, body.name, body.team_id, body.skills, body.availability, now
+                )
+        finally:
+            conn.close()
+
+    # ---------------- 回拨：预约与执行 ----------------
+
+    @app.post("/tickets/{ticket_id}/callbacks", status_code=201)
+    def book_callback(ticket_id: int, body: CallbackBookIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = cbmod.business_now(conn)
+                result = cbmod.book_callback(
+                    conn, ticket_id, body.skill,
+                    cbmod.parse_minute(body.start), cbmod.parse_minute(body.end),
+                    body.actor, now, body.agent_id,
+                )
+            return result
+        finally:
+            conn.close()
+
+    @app.get("/tickets/{ticket_id}/callbacks")
+    def list_ticket_callbacks(ticket_id: int):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = cbmod.business_now(conn)
+                cbmod.sweep_missed(conn, now)
+                service._ticket_row(conn, ticket_id)
+                return cbmod.list_callbacks(conn, ticket_id=ticket_id)
+        finally:
+            conn.close()
+
+    @app.get("/callbacks")
+    def list_callbacks(ticket_id: int | None = None, status: str | None = None,
+                       team_id: int | None = None, agent_id: int | None = None):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = cbmod.business_now(conn)
+                cbmod.sweep_missed(conn, now)
+                return cbmod.list_callbacks(conn, ticket_id, status, team_id, agent_id)
+        finally:
+            conn.close()
+
+    @app.get("/callbacks/{callback_id}")
+    def get_callback(callback_id: int):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = cbmod.business_now(conn)
+                cbmod.sweep_missed(conn, now)
+                return cbmod.get_callback(conn, callback_id)
+        finally:
+            conn.close()
+
+    @app.post("/callbacks/{callback_id}/reschedule")
+    def reschedule_callback(callback_id: int, body: CallbackRescheduleIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = cbmod.business_now(conn)
+                result = cbmod.reschedule_callback(
+                    conn, callback_id,
+                    cbmod.parse_minute(body.start), cbmod.parse_minute(body.end),
+                    body.actor, now,
+                )
+            return result
+        finally:
+            conn.close()
+
+    @app.post("/callbacks/{callback_id}/cancel")
+    def cancel_callback(callback_id: int, body: CallbackCancelIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = cbmod.business_now(conn)
+                result = cbmod.cancel_callback(conn, callback_id, body.actor, now, body.reason)
+            return result
+        finally:
+            conn.close()
+
+    @app.post("/callbacks/{callback_id}/start")
+    def start_callback(callback_id: int, body: CallbackStartIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = cbmod.business_now(conn)
+                result = cbmod.start_callback(
+                    conn, callback_id, body.agent_id, body.actor, now, _at(body.at)
+                )
+            return result
+        finally:
+            conn.close()
+
+    @app.post("/callbacks/{callback_id}/end")
+    def end_callback(callback_id: int, body: CallbackEndIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = cbmod.business_now(conn)
+                result = cbmod.end_callback(conn, callback_id, body.actor, now, _at(body.at))
             return result
         finally:
             conn.close()

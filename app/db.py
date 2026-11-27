@@ -144,6 +144,73 @@ CREATE TABLE IF NOT EXISTS clock_overrides (
     real_at    INTEGER NOT NULL,
     created_by TEXT    NOT NULL DEFAULT 'duty'
 );
+
+-- --------------------------------------------------------------------------
+-- 回拨预约：坐席档案 / 技能 / 可用时段 / 预约
+-- 可用时段与团队时限日历相互独立，使用绝对 epoch 分钟的半开区间。
+-- --------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS agents (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT    NOT NULL,
+    team_id    INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (team_id) REFERENCES teams(id)
+);
+CREATE INDEX IF NOT EXISTS idx_agents_team ON agents(team_id);
+
+CREATE TABLE IF NOT EXISTS agent_skills (
+    agent_id INTEGER NOT NULL,
+    skill    TEXT    NOT NULL,
+    PRIMARY KEY (agent_id, skill),
+    FOREIGN KEY (agent_id) REFERENCES agents(id)
+);
+
+-- 坐席可用时段：绝对分钟的半开区间 [start_minute, end_minute)，同一坐席互不重叠
+CREATE TABLE IF NOT EXISTS agent_availability (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id     INTEGER NOT NULL,
+    start_minute INTEGER NOT NULL,
+    end_minute   INTEGER NOT NULL,
+    CHECK (start_minute < end_minute),
+    FOREIGN KEY (agent_id) REFERENCES agents(id)
+);
+CREATE INDEX IF NOT EXISTS idx_availability_agent ON agent_availability(agent_id, start_minute);
+
+-- 回拨预约。status: pending | in_progress | completed | cancelled | missed
+CREATE TABLE IF NOT EXISTS callbacks (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id         INTEGER NOT NULL,
+    team_id           INTEGER NOT NULL,   -- 当前承接团队；转组时随未开始预约一并转移
+    skill             TEXT    NOT NULL,   -- 所需技能（客户承诺的一部分，转组保留）
+    start_minute      INTEGER NOT NULL,   -- 约定窗口 [start, end)
+    end_minute        INTEGER NOT NULL,
+    status            TEXT    NOT NULL,
+    agent_id          INTEGER,            -- 预选坐席；开始后固定为执行坐席
+    booked_at         INTEGER NOT NULL,
+    reschedule_count  INTEGER NOT NULL DEFAULT 0,
+    started_at        INTEGER,
+    ended_at          INTEGER,
+    cancelled_at      INTEGER,
+    cancel_reason     TEXT,
+    missed_at         INTEGER,
+    CHECK (start_minute < end_minute),
+    FOREIGN KEY (ticket_id) REFERENCES tickets(id),
+    FOREIGN KEY (team_id) REFERENCES teams(id),
+    FOREIGN KEY (agent_id) REFERENCES agents(id)
+);
+CREATE INDEX IF NOT EXISTS idx_callbacks_ticket ON callbacks(ticket_id, id);
+CREATE INDEX IF NOT EXISTS idx_callbacks_status ON callbacks(status);
+CREATE INDEX IF NOT EXISTS idx_callbacks_agent ON callbacks(agent_id);
+-- 每张工单同时最多一笔未开始或进行中的回拨
+CREATE UNIQUE INDEX IF NOT EXISTS idx_callbacks_one_active
+    ON callbacks(ticket_id) WHERE status IN ('pending', 'in_progress');
+
+-- 回拨业务时刻高水位：取时钟登记与回拨操作到达过的最晚分钟，时钟回放不能使其回落
+CREATE TABLE IF NOT EXISTS callback_clock (
+    id                INTEGER PRIMARY KEY CHECK (id = 1),
+    high_water_minute INTEGER NOT NULL
+);
 """
 
 
