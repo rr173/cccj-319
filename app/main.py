@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import callbacks as cbmod
-from . import db, service, timeutil
+from . import db, incidents as incmod, delivery_worker, sender as sendermod, service, timeutil
 
 # --------------------------------------------------------------------------
 # 请求模型
@@ -153,6 +153,42 @@ class CallbackEndIn(BaseModel):
     at: str | None = None
 
 
+# --------------------------------------------------------------------------
+# 共享故障通报请求模型
+# --------------------------------------------------------------------------
+
+
+class IncidentIn(BaseModel):
+    title: str = Field(min_length=1)
+    description: str = ""
+    actor: str = "agent"
+
+
+class LinkIn(BaseModel):
+    ticket_id: int
+    customer_id: str = Field(min_length=1)
+    actor: str = "agent"
+
+
+class UnlinkIn(BaseModel):
+    ticket_id: int
+    actor: str = "agent"
+
+
+class NotificationIn(BaseModel):
+    enabled: bool
+    actor: str = "customer"
+
+
+class UpdateIn(BaseModel):
+    body: str = Field(min_length=1)
+    actor: str = "agent"
+
+
+class DeliveryRunIn(BaseModel):
+    lease_seconds: int | None = None
+
+
 def _at(value: str | None) -> int | None:
     if value is None:
         return None
@@ -179,6 +215,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(title="承诺时限后端", version="1.0.0", lifespan=lifespan)
     app.state.db_path = path
+    # 可替换发送端：测试可直接替换 app.state.sender；真实渠道在 build_sender 内接入。
+    app.state.sender = sendermod.build_sender()
 
     def get_conn():
         return db.connect(app.state.db_path)
@@ -623,6 +661,155 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 now = cbmod.business_now(conn)
                 result = cbmod.end_callback(conn, callback_id, body.actor, now, _at(body.at))
             return result
+        finally:
+            conn.close()
+
+    # ---------------- 共享故障通报 ----------------
+
+    @app.post("/incidents", status_code=201)
+    def create_incident(body: IncidentIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                return incmod.create_incident(conn, body.title, body.description, body.actor, now)
+        finally:
+            conn.close()
+
+    @app.get("/incidents")
+    def list_incidents():
+        conn = get_conn()
+        try:
+            return incmod.list_incidents(conn)
+        finally:
+            conn.close()
+
+    @app.get("/incidents/{incident_id}")
+    def get_incident(incident_id: int):
+        conn = get_conn()
+        try:
+            return incmod.get_incident(conn, incident_id)
+        finally:
+            conn.close()
+
+    @app.post("/incidents/{incident_id}/links", status_code=201)
+    def link_ticket(incident_id: int, body: LinkIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                return incmod.link_ticket(
+                    conn, incident_id, body.ticket_id, body.customer_id, body.actor, now
+                )
+        finally:
+            conn.close()
+
+    @app.post("/incidents/{incident_id}/unlinks")
+    def unlink_ticket(incident_id: int, body: UnlinkIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                return incmod.unlink_ticket(conn, incident_id, body.ticket_id, body.actor, now)
+        finally:
+            conn.close()
+
+    @app.get("/incidents/{incident_id}/links")
+    def list_incident_links(incident_id: int, active: bool = False):
+        conn = get_conn()
+        try:
+            return incmod.list_links(conn, incident_id, active_only=active)
+        finally:
+            conn.close()
+
+    @app.put("/customers/{customer_id}/notification")
+    def set_notification(customer_id: str, body: NotificationIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                return incmod.set_notification(conn, customer_id, body.enabled, body.actor, now)
+        finally:
+            conn.close()
+
+    @app.get("/customers/{customer_id}/notification")
+    def get_notification(customer_id: str):
+        conn = get_conn()
+        try:
+            return incmod.get_notification(conn, customer_id)
+        finally:
+            conn.close()
+
+    @app.post("/incidents/{incident_id}/updates", status_code=201)
+    def publish_update(incident_id: int, body: UpdateIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                return incmod.publish_update(conn, incident_id, body.body, body.actor, now)
+        finally:
+            conn.close()
+
+    @app.get("/incidents/{incident_id}/updates")
+    def list_incident_updates(incident_id: int):
+        conn = get_conn()
+        try:
+            return incmod.list_updates(conn, incident_id)
+        finally:
+            conn.close()
+
+    @app.get("/updates/{update_id}")
+    def get_update(update_id: int):
+        conn = get_conn()
+        try:
+            return incmod.get_update(conn, update_id)
+        finally:
+            conn.close()
+
+    @app.get("/updates/{update_id}/deliveries")
+    def list_update_deliveries(update_id: int, status: str | None = None):
+        conn = get_conn()
+        try:
+            return incmod.list_deliveries(conn, update_id=update_id, status=status)
+        finally:
+            conn.close()
+
+    @app.get("/incidents/{incident_id}/deliveries")
+    def list_incident_deliveries(incident_id: int, status: str | None = None,
+                                 customer_id: str | None = None):
+        conn = get_conn()
+        try:
+            return incmod.list_deliveries(
+                conn, incident_id=incident_id, status=status, customer_id=customer_id
+            )
+        finally:
+            conn.close()
+
+    @app.get("/deliveries/{delivery_id}")
+    def get_delivery(delivery_id: int):
+        conn = get_conn()
+        try:
+            return incmod.get_delivery(conn, delivery_id)
+        finally:
+            conn.close()
+
+    @app.get("/deliveries/{delivery_id}/attempts")
+    def get_delivery_attempts(delivery_id: int):
+        conn = get_conn()
+        try:
+            return incmod.list_attempts(conn, delivery_id)
+        finally:
+            conn.close()
+
+    @app.post("/delivery/run")
+    def run_delivery(body: DeliveryRunIn | None = None):
+        # 推进入口：并行调用或服务重启后反复调用都是安全的（租位 + 发送端幂等）。
+        kwargs = {}
+        if body is not None and body.lease_seconds is not None:
+            kwargs["lease_seconds"] = body.lease_seconds
+        conn = get_conn()
+        try:
+            return delivery_worker.run_cycle(conn, app.state.sender, **kwargs)
         finally:
             conn.close()
 

@@ -211,6 +211,114 @@ CREATE TABLE IF NOT EXISTS callback_clock (
     id                INTEGER PRIMARY KEY CHECK (id = 1),
     high_water_minute INTEGER NOT NULL
 );
+
+-- --------------------------------------------------------------------------
+-- 共享故障通报：故障 / 工单关联 / 通知开关 / 进展 / 逐客户投递
+-- 通报是独立域：不写工单答复、不改工单状态，SLA、升级与回拨口径完全不变。
+-- --------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS incidents (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    title       TEXT    NOT NULL,
+    description TEXT    NOT NULL DEFAULT '',
+    created_by  TEXT    NOT NULL DEFAULT 'agent',
+    created_at  INTEGER NOT NULL
+);
+
+-- 故障-工单关联（带客户标识）。撤销只置 revoked_at，历史行保留；
+-- 部分唯一索引保证同一工单在同一故障下同时只有一条有效关联。
+CREATE TABLE IF NOT EXISTS incident_links (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id INTEGER NOT NULL,
+    ticket_id   INTEGER NOT NULL,
+    customer_id TEXT    NOT NULL,
+    linked_by   TEXT    NOT NULL DEFAULT 'agent',
+    linked_at   INTEGER NOT NULL,
+    revoked_by  TEXT,
+    revoked_at  INTEGER,
+    FOREIGN KEY (incident_id) REFERENCES incidents(id),
+    FOREIGN KEY (ticket_id) REFERENCES tickets(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_links_one_active
+    ON incident_links(incident_id, ticket_id) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_incident_links_customer
+    ON incident_links(incident_id, customer_id) WHERE revoked_at IS NULL;
+
+-- 客户通知开关。无记录视为默认开启；显式关闭后 notify=0。
+CREATE TABLE IF NOT EXISTS notification_settings (
+    customer_id TEXT    PRIMARY KEY,
+    notify      INTEGER NOT NULL DEFAULT 1,   -- 1 开启 / 0 关闭
+    updated_by  TEXT    NOT NULL DEFAULT 'customer',
+    updated_at  INTEGER NOT NULL
+);
+
+-- 故障进展：发布即锁定正文与序号；通知名单在发布事务内定格。
+CREATE TABLE IF NOT EXISTS incident_updates (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id  INTEGER NOT NULL,
+    seq          INTEGER NOT NULL,           -- 同一故障内从 1 递增
+    body         TEXT    NOT NULL,           -- 锁定的正文
+    published_by TEXT    NOT NULL DEFAULT 'agent',
+    published_at INTEGER NOT NULL,
+    FOREIGN KEY (incident_id) REFERENCES incidents(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_updates_seq
+    ON incident_updates(incident_id, seq);
+
+-- 逐客户投递。status: pending | skipped | in_flight | delivered
+--   pending   待处理（尚未做出投递/跳过决定，或被同客户更早进展门控）
+--   skipped   已永久跳过（skip_reason: unsubscribed | no_active_link）
+--   in_flight 已决定交付、已交给发送端但送达结果待确认
+--   delivered 已确认送达
+-- tainted: 发布之后、决定之前客户曾关闭通知；重新开启也不能消除。
+-- lease_*  : 真实时间秒级租位，供并行 worker 抢占，崩溃后超时可被他人接管。
+CREATE TABLE IF NOT EXISTS incident_deliveries (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_key TEXT    NOT NULL UNIQUE,    -- 稳定投递标识，也是发送端幂等键
+    incident_id  INTEGER NOT NULL,
+    update_id    INTEGER NOT NULL,
+    customer_id  TEXT    NOT NULL,
+    status       TEXT    NOT NULL,
+    tainted      INTEGER NOT NULL DEFAULT 0,
+    skip_reason  TEXT,
+    decided_at   INTEGER,                    -- 做出 skipped/in_flight 决定的业务分钟
+    delivered_at INTEGER,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    lease_owner  TEXT,
+    lease_until  INTEGER,                    -- 真实 epoch 秒
+    created_at   INTEGER NOT NULL,
+    FOREIGN KEY (incident_id) REFERENCES incidents(id),
+    FOREIGN KEY (update_id) REFERENCES incident_updates(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_update_customer
+    ON incident_deliveries(update_id, customer_id);
+CREATE INDEX IF NOT EXISTS idx_delivery_customer_order
+    ON incident_deliveries(incident_id, customer_id, update_id);
+CREATE INDEX IF NOT EXISTS idx_delivery_status ON incident_deliveries(status);
+
+-- 发布时刻的关联快照：跳过判定只认快照内是否仍有持续有效的关联；
+-- 发布后重新关联或新增工单都不会出现在这里，因而不能恢复一次投递。
+CREATE TABLE IF NOT EXISTS incident_delivery_links (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_id INTEGER NOT NULL,
+    link_id     INTEGER NOT NULL,
+    ticket_id   INTEGER NOT NULL,
+    FOREIGN KEY (delivery_id) REFERENCES incident_deliveries(id),
+    FOREIGN KEY (link_id) REFERENCES incident_links(id)
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_links_delivery ON incident_delivery_links(delivery_id);
+
+-- 投递尝试流水（含跳过决定与每次发送结果），便于逐客户审计。
+CREATE TABLE IF NOT EXISTS incident_delivery_attempts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_id INTEGER NOT NULL,
+    kind        TEXT    NOT NULL,            -- skip | send_ok | send_timeout | send_error
+    detail      TEXT,
+    at          INTEGER NOT NULL,
+    FOREIGN KEY (delivery_id) REFERENCES incident_deliveries(id)
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_attempts_delivery
+    ON incident_delivery_attempts(delivery_id, id);
 """
 
 

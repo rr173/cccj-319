@@ -146,3 +146,95 @@ POST   /callbacks/{id}/end                     执行坐席登记结束，可补
   `cancelled` / `missed`；部分唯一索引保证一单一笔活跃。
 - `callback_clock`：单行高水位。
 - 回拨动作写入既有 `ticket_events`（`callback_booked/rescheduled/cancelled/started/ended/missed/transferred`）。
+
+## 共享故障通报
+
+同一故障常让客服收到多张工单。客服可登记故障、把工单（连同客户标识）关联到
+故障并发布进展；系统按发布时刻锁定的名单逐客户投递，并可查询逐客户投递结果。
+通报是**独立域**：不算工单回复或结案，不写 `ticket_events`，不改变 SLA 预算、
+升级与回拨的任何行为。
+
+### 接口
+
+```
+POST   /incidents                               登记故障
+GET    /incidents                        ?id=
+GET    /incidents/{id}
+POST   /incidents/{id}/links                   关联工单（带 customer_id）
+POST   /incidents/{id}/unlinks                 撤销关联（ticket_id）
+GET    /incidents/{id}/links           ?active=
+PUT    /customers/{customer_id}/notification   开启/关闭通知（{enabled: bool}，默认开启）
+GET    /customers/{customer_id}/notification
+POST   /incidents/{id}/updates                 发布进展（锁定正文与通知名单）
+GET    /incidents/{id}/updates
+GET    /updates/{id}                            含四态计数 status_counts
+GET    /updates/{id}/deliveries        ?status=pending|skipped|in_flight|delivered
+GET    /incidents/{id}/deliveries      ?status=&customer_id=
+GET    /deliveries/{id}                         单条投递（含发布时关联快照）
+GET    /deliveries/{id}/attempts                投递尝试/跳过流水
+POST   /delivery/run                            推进投递（可并行、可反复调用）
+```
+
+CLI 一次性推进（服务重启后重跑即可恢复未确认投递）：
+
+```bash
+TICKET_DB=./tickets.db NOTIFY_SENDER_DB=./sender.db \
+  python3 -m app.delivery_worker --db ./tickets.db
+```
+
+### 发布语义（锁定名单，不补发）
+
+- 发布在一个 `BEGIN IMMEDIATE` 事务内定格正文与名单：当时有**有效关联**且
+  **开启通知**的客户才进入名单；同一客户多张工单只生成一条投递，其全部有效
+  关联写入该投递的发布快照（`incident_delivery_links`）。
+- 发布后才入组的关联、发布后才开启的通知，不会补发旧进展。
+- 同一工单在同一故障下只有一条有效关联（部分唯一索引
+  `idx_incident_links_one_active` 兜底；重复关联返回 `409`）。
+
+### 投递状态机与永久跳过
+
+```
+pending ──┬─> skipped        （永久跳过，终态）
+          └─> in_flight ──> delivered   （确认送达，终态）
+```
+
+四种查询口径与状态一一对应：`pending` 待处理、`skipped` 已跳过、`in_flight`
+已决定交付但结果待确认、`delivered` 已确认送达。
+
+- 跳过决定**只在 pending 阶段做一次**，两个来源：
+  - `unsubscribed`：发布之后到决定之前客户曾关闭通知。关闭动作把该客户所有
+    pending 投递置 `tainted=1`，即使随后重新开启也不消除；
+  - `no_active_link`：发布快照中的关联已**全部**撤销。只要快照里还有一条
+    持续有效，撤掉其他关联不影响投递；发布后重新关联/新增工单不在快照内，
+    不能恢复投递。
+- 进入 `in_flight` 即已做出交付决定：之后的撤订、撤关联只影响后续进展，
+  本投递继续重试到确认送达，不会停止。
+- 同故障同客户严格按进展序号交付：更早一条未终结（pending/in_flight）时，
+  后一条保持 pending；某客户被门控不影响其他客户。不同故障之间互不门控。
+
+### 可替换发送端与本地替身
+
+- 发送端接口见 `app/sender.py` 的 `Sender`：接收稳定投递标识 `delivery_key`、
+  客户标识与正文；接入真实渠道只需实现同接口并在 `build_sender()` 装配。
+- 本地替身 `StubSender` 把回执持久化在独立 SQLite（`NOTIFY_SENDER_DB`，
+  默认内存库；给文件路径即可跨重启保留），按 `delivery_key` 幂等：
+  同一标识重试只触达一次。支持故障注入：
+  `queue_behavior(key, "pre_timeout"|"post_timeout"|"error"|"ok")` 一次性行为、
+  `stick_behavior` 持续行为、`clear_behaviors` 清除。
+  - `pre_timeout`：接收前超时，无回执，重试才真正触达；
+  - `post_timeout`：先落回执再超时，重试只得到幂等重放，绝不二次触达。
+- `POST /delivery/run` 是推进入口：每个决定在独立短事务内完成，发送调用在
+  事务外。`in_flight` 带真实时间租位（`lease_owner/lease_until`），并行 worker
+  靠条件更新抢占；进程崩溃后租约过期，下一轮（或重启后）自动接管。
+  因此并行推进、服务重启都不会漏发或重复触达。
+
+### 数据模型（通报部分）
+
+- `incidents` / `incident_links`：故障与带客户标识的工单关联，撤销只置
+  `revoked_at`，历史行保留。
+- `notification_settings`：客户通知开关，无记录即默认开启。
+- `incident_updates`：进展正文与故障内递增序号，发布即不可变。
+- `incident_deliveries`：逐客户投递（四态、`tainted`、跳过原因、租位、
+  尝试次数、稳定 `delivery_key`）。
+- `incident_delivery_links`：发布时刻关联快照，跳过判定的唯一依据。
+- `incident_delivery_attempts`：跳过与每次发送尝试的审计流水。
