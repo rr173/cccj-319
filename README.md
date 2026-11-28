@@ -238,3 +238,72 @@ pending ──┬─> skipped        （永久跳过，终态）
   尝试次数、稳定 `delivery_key`）。
 - `incident_delivery_links`：发布时刻关联快照，跳过判定的唯一依据。
 - `incident_delivery_attempts`：跳过与每次发送尝试的审计流水。
+
+## 企业客户赔付核销
+
+企业客户的工单超过解决时限时，客服合同赔付可抵扣发票的额度。财务登记企业
+账户与固定条款、把工单归入账户，随后可预占额度、确认抵扣、整笔冲销；值班员
+追溯更正工作日历后，财务仍能按原凭据对账。不接入实际开票或支付系统。金额
+一律**整数分**。核销是**独立域**：只读取工单的结案时刻与 resolution 当前
+判定，原时限、升级、回拨与通报行为不变。
+
+### 接口
+
+```
+POST   /credit-accounts                              登记企业账户（每张超时工单赔付额、每月赔付上限）
+GET    /credit-accounts        GET /credit-accounts/{id}
+POST   /credit-accounts/{id}/ticket-assignments      把已有工单一次性归入（结案后也可补登记）
+GET    /credit-accounts/{id}/tickets                 已归入工单
+GET    /credit-accounts/{id}/reconciliation          账户对账（应得/余额/未弥补额/申请/凭据）
+
+POST   /credit-accounts/{id}/credit-requests         申请预占（发票编号 + 申请编号 + 金额）
+GET    /credit-accounts/{id}/credit-requests ?status=
+GET    /credit-requests/{id}                         含有效预占的当前来源
+POST   /credit-requests/{id}/cancel                  取消有效预占
+POST   /credit-requests/{id}/confirm                 确认并出具抵扣凭据
+
+GET    /credit-accounts/{id}/vouchers
+GET    /credit-vouchers/{id}                         凭据（含来源行与冲销结果）
+POST   /credit-vouchers/{id}/reverse                 整笔冲销已确认抵扣
+```
+
+### 应得额度口径
+
+- 仅**已结案**且按现有口径**当前判为解决超时**的工单有资格；结案、归属登记、
+  日历更正都会改变应得（包括同月其他工单）。
+- 按结案时刻的 **UTC 月份**归账；同月按（结案时刻, 工单编号）依次发放
+  `min(每张赔付额, 当月剩余上限)`，剩余不足只给余量。
+- 填补与预占使用额度时**跨月可合用**，都优先用结案更早的剩余额度，同刻按
+  工单编号。
+
+### 预占 / 凭据 / 冲销
+
+- 申请预占必须**全额有着落**才接受；有效预占按原受理顺序分配，来源可随状态
+  重排；当前不能全额兑现的一笔**立即永久失效**且不占额度（写事务内持久化，
+  之后额度恢复、他人取消或抵扣冲销都不得复活），后面的申请仍可用余额。
+- 确认出具**不可改写**的抵扣凭据，金额来源 = 该笔有效预占当时分得的工单；
+  改判不撤回凭据、也不改记别的工单。
+- 某工单当前应得不足以覆盖其未冲销抵扣时（含改判归零），差额先由账户其他
+  工单未抵扣额度填补，仍不足记**未弥补额**；填补优先于一切有效预占。
+- 冲销只能**整笔**退回已确认抵扣：释放其占用，保留原凭据与冲销结果。
+- 幂等：申请编号在账户内唯一并永久绑定原请求（同号重试按原参数重放，参数
+  不符返回 409）；取消/确认/冲销重试只重放结果，不重复扣减或释放。
+  同企业同发票同时最多一笔有效预占或未冲销抵扣（部分唯一索引兜底）。
+
+### 一致性与持久性
+
+所有核销写操作在 `BEGIN IMMEDIATE` 事务内执行；结案、日历更正、归属登记在
+同事务末尾统一重算账户分配——一次更正影响多张工单时按最终一致状态结算，
+中间结果不会使预占失效；即使改判后无人查询，失效也已落库，随后额度回升
+不能掩盖。失败请求整体回滚不留部分变更；全部状态存于 SQLite，服务重启
+不丢失。
+
+### 数据模型（核销部分）
+
+- `credit_accounts`：企业账户与固定条款（每张赔付额、每月上限，整数分）。
+- `credit_ticket_assignments`：工单归属，一单一户（唯一索引），结案前后均可登记。
+- `credit_requests`：预占申请（`valid/cancelled/invalid/confirmed`），
+  `(account_id, application_no)` 唯一；`invalid` 为终态。
+- `deduction_vouchers` / `deduction_voucher_lines`：抵扣凭据与来源行，
+  出具后不可改写；`active/reversed`。
+- `deduction_reversals`：冲销记录，一笔凭据最多一次。

@@ -7,12 +7,12 @@ import tempfile
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import callbacks as cbmod
-from . import db, incidents as incmod, delivery_worker, sender as sendermod, service, timeutil
+from . import db, incidents as incmod, delivery_worker, redemption, sender as sendermod, service, timeutil
 
 # --------------------------------------------------------------------------
 # 请求模型
@@ -189,6 +189,34 @@ class DeliveryRunIn(BaseModel):
     lease_seconds: int | None = None
 
 
+# --------------------------------------------------------------------------
+# 企业客户赔付核销请求模型
+# --------------------------------------------------------------------------
+
+
+class CreditAccountIn(BaseModel):
+    name: str = Field(min_length=1)
+    per_ticket_amount: int = Field(ge=0)   # 每张超时工单赔付额（整数分）
+    monthly_cap: int = Field(ge=0)         # 账户每月赔付上限（整数分）
+    actor: str = "finance"
+
+
+class TicketAssignmentIn(BaseModel):
+    ticket_ids: list[int] = Field(min_length=1)
+    actor: str = "finance"
+
+
+class CreditRequestIn(BaseModel):
+    invoice_no: str = Field(min_length=1)
+    application_no: str = Field(min_length=1)
+    amount: int = Field(gt=0)              # 预占金额（整数分）
+    actor: str = "finance"
+
+
+class CreditActionIn(BaseModel):
+    actor: str = "finance"
+
+
 def _at(value: str | None) -> int | None:
     if value is None:
         return None
@@ -271,6 +299,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 result = service.set_team_calendar(
                     conn, team_id, day, body.intervals, body.actor, now
                 )
+                # 核销联动：一次更正影响多张工单时，全部重算后统一结算，
+                # 中间结果不会使预占失效。
+                redemption.recompute_all(conn)
             return result
         finally:
             conn.close()
@@ -465,6 +496,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             with db.transaction(conn):
                 now = service.now_minute(conn)
                 service.resolve_ticket(conn, ticket_id, body.actor, _at(body.at), now)
+                # 核销联动：结案可能使工单获得赔付资格，统一重算账户分配。
+                redemption.recompute_all(conn)
             return service.ticket_detail(conn, ticket_id)
         finally:
             conn.close()
@@ -810,6 +843,145 @@ def create_app(db_path: str | None = None) -> FastAPI:
         conn = get_conn()
         try:
             return delivery_worker.run_cycle(conn, app.state.sender, **kwargs)
+        finally:
+            conn.close()
+
+    # ---------------- 企业客户赔付核销 ----------------
+
+    @app.post("/credit-accounts", status_code=201)
+    def create_credit_account(body: CreditAccountIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                return redemption.create_account(
+                    conn, body.name, body.per_ticket_amount, body.monthly_cap, body.actor, now
+                )
+        finally:
+            conn.close()
+
+    @app.get("/credit-accounts")
+    def list_credit_accounts():
+        conn = get_conn()
+        try:
+            return redemption.list_accounts(conn)
+        finally:
+            conn.close()
+
+    @app.get("/credit-accounts/{account_id}")
+    def get_credit_account(account_id: int):
+        conn = get_conn()
+        try:
+            return redemption.account_view(redemption.get_account(conn, account_id))
+        finally:
+            conn.close()
+
+    @app.post("/credit-accounts/{account_id}/ticket-assignments", status_code=201)
+    def assign_account_tickets(account_id: int, body: TicketAssignmentIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                return redemption.assign_tickets(
+                    conn, account_id, body.ticket_ids, body.actor, now
+                )
+        finally:
+            conn.close()
+
+    @app.get("/credit-accounts/{account_id}/tickets")
+    def list_account_tickets(account_id: int):
+        conn = get_conn()
+        try:
+            return redemption.list_assigned_tickets(conn, account_id)
+        finally:
+            conn.close()
+
+    @app.get("/credit-accounts/{account_id}/reconciliation")
+    def account_reconciliation(account_id: int):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                return redemption.reconciliation(conn, account_id)
+        finally:
+            conn.close()
+
+    @app.post("/credit-accounts/{account_id}/credit-requests", status_code=201)
+    def create_credit_request(account_id: int, body: CreditRequestIn, response: Response):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                view, created = redemption.create_request(
+                    conn, account_id, body.invoice_no, body.application_no,
+                    body.amount, body.actor, now,
+                )
+                if not created:
+                    response.status_code = 200  # 同一申请编号：幂等重放原请求
+                return view
+        finally:
+            conn.close()
+
+    @app.get("/credit-accounts/{account_id}/credit-requests")
+    def list_credit_requests(account_id: int, status: str | None = None):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                return redemption.list_requests(conn, account_id, status)
+        finally:
+            conn.close()
+
+    @app.get("/credit-requests/{request_id}")
+    def get_credit_request(request_id: int):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                return redemption.get_request(conn, request_id)
+        finally:
+            conn.close()
+
+    @app.post("/credit-requests/{request_id}/cancel")
+    def cancel_credit_request(request_id: int, body: CreditActionIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                return redemption.cancel_request(conn, request_id, body.actor, now)
+        finally:
+            conn.close()
+
+    @app.post("/credit-requests/{request_id}/confirm")
+    def confirm_credit_request(request_id: int, body: CreditActionIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                return redemption.confirm_request(conn, request_id, body.actor, now)
+        finally:
+            conn.close()
+
+    @app.get("/credit-accounts/{account_id}/vouchers")
+    def list_account_vouchers(account_id: int):
+        conn = get_conn()
+        try:
+            return redemption.list_vouchers(conn, account_id)
+        finally:
+            conn.close()
+
+    @app.get("/credit-vouchers/{voucher_id}")
+    def get_credit_voucher(voucher_id: int):
+        conn = get_conn()
+        try:
+            return redemption.voucher_view(conn, redemption.get_voucher_row(conn, voucher_id))
+        finally:
+            conn.close()
+
+    @app.post("/credit-vouchers/{voucher_id}/reverse")
+    def reverse_credit_voucher(voucher_id: int, body: CreditActionIn):
+        conn = get_conn()
+        try:
+            with db.transaction(conn):
+                now = service.now_minute(conn)
+                return redemption.reverse_voucher(conn, voucher_id, body.actor, now)
         finally:
             conn.close()
 

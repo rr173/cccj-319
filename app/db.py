@@ -319,6 +319,107 @@ CREATE TABLE IF NOT EXISTS incident_delivery_attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_delivery_attempts_delivery
     ON incident_delivery_attempts(delivery_id, id);
+
+-- --------------------------------------------------------------------------
+-- 企业客户超时赔付核销：账户条款 / 工单归属 / 预占申请 / 抵扣凭据 / 冲销
+-- 金额一律整数分。核销是独立域：不改写工单、SLA、升级、回拨与通报的任何
+-- 口径，只读取工单的结案时刻与 resolution 当前判定。
+-- --------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS credit_accounts (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    name               TEXT    NOT NULL UNIQUE,
+    per_ticket_amount  INTEGER NOT NULL CHECK (per_ticket_amount >= 0),  -- 每张超时工单赔付额（分）
+    monthly_cap        INTEGER NOT NULL CHECK (monthly_cap >= 0),        -- 账户每月赔付上限（分）
+    created_by         TEXT    NOT NULL DEFAULT 'finance',
+    created_at         INTEGER NOT NULL
+);
+
+-- 工单归属：一张工单最多归入一个企业账户；结案前结案后都可登记
+CREATE TABLE IF NOT EXISTS credit_ticket_assignments (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id  INTEGER NOT NULL,
+    ticket_id   INTEGER NOT NULL,
+    assigned_by TEXT    NOT NULL DEFAULT 'finance',
+    assigned_at INTEGER NOT NULL,
+    FOREIGN KEY (account_id) REFERENCES credit_accounts(id),
+    FOREIGN KEY (ticket_id) REFERENCES tickets(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_credit_assign_ticket
+    ON credit_ticket_assignments(ticket_id);
+CREATE INDEX IF NOT EXISTS idx_credit_assign_account
+    ON credit_ticket_assignments(account_id, id);
+
+-- 预占申请。status: valid | cancelled | invalid | confirmed
+-- application_no 在账户内唯一并永久绑定原请求（同号重试幂等重放）；
+-- invalid 是终态：之后额度恢复、他人取消或抵扣冲销都不得复活。
+CREATE TABLE IF NOT EXISTS credit_requests (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id     INTEGER NOT NULL,
+    invoice_no     TEXT    NOT NULL,
+    application_no TEXT    NOT NULL,
+    amount         INTEGER NOT NULL CHECK (amount > 0),
+    status         TEXT    NOT NULL,
+    created_by     TEXT    NOT NULL DEFAULT 'finance',
+    created_at     INTEGER NOT NULL,
+    cancelled_at   INTEGER,
+    invalidated_at INTEGER,
+    confirmed_at   INTEGER,
+    voucher_id     INTEGER,
+    FOREIGN KEY (account_id) REFERENCES credit_accounts(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_credit_requests_appno
+    ON credit_requests(account_id, application_no);
+-- 同企业同发票同时最多一笔有效预占（确认后该发票由抵扣凭据接管约束）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_credit_requests_active_invoice
+    ON credit_requests(account_id, invoice_no) WHERE status = 'valid';
+CREATE INDEX IF NOT EXISTS idx_credit_requests_account
+    ON credit_requests(account_id, id);
+
+-- 抵扣凭据：确认即定格，金额与来源行永不改写、不改记其他工单；
+-- 冲销只置状态并留冲销记录，原凭据保留。
+CREATE TABLE IF NOT EXISTS deduction_vouchers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id  INTEGER NOT NULL UNIQUE,
+    account_id  INTEGER NOT NULL,
+    invoice_no  TEXT    NOT NULL,
+    amount      INTEGER NOT NULL CHECK (amount > 0),
+    status      TEXT    NOT NULL,          -- active | reversed
+    issued_by   TEXT    NOT NULL DEFAULT 'finance',
+    issued_at   INTEGER NOT NULL,
+    reversed_at INTEGER,
+    FOREIGN KEY (request_id) REFERENCES credit_requests(id),
+    FOREIGN KEY (account_id) REFERENCES credit_accounts(id)
+);
+-- 同企业同发票同时最多一笔未冲销抵扣
+CREATE UNIQUE INDEX IF NOT EXISTS idx_voucher_active_invoice
+    ON deduction_vouchers(account_id, invoice_no) WHERE status = 'active';
+
+-- 凭据来源行：金额分别来自哪些工单（确认时刻的分配快照，不可改写）
+CREATE TABLE IF NOT EXISTS deduction_voucher_lines (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    voucher_id INTEGER NOT NULL,
+    ticket_id  INTEGER NOT NULL,
+    amount     INTEGER NOT NULL CHECK (amount > 0),
+    FOREIGN KEY (voucher_id) REFERENCES deduction_vouchers(id),
+    FOREIGN KEY (ticket_id) REFERENCES tickets(id)
+);
+CREATE INDEX IF NOT EXISTS idx_voucher_lines_voucher
+    ON deduction_voucher_lines(voucher_id, id);
+CREATE INDEX IF NOT EXISTS idx_voucher_lines_ticket
+    ON deduction_voucher_lines(ticket_id);
+
+-- 冲销记录：只能整笔退回已确认抵扣，一笔凭据最多冲销一次
+CREATE TABLE IF NOT EXISTS deduction_reversals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    voucher_id  INTEGER NOT NULL UNIQUE,
+    account_id  INTEGER NOT NULL,
+    amount      INTEGER NOT NULL,
+    actor       TEXT    NOT NULL DEFAULT 'finance',
+    reversed_at INTEGER NOT NULL,
+    FOREIGN KEY (voucher_id) REFERENCES deduction_vouchers(id),
+    FOREIGN KEY (account_id) REFERENCES credit_accounts(id)
+);
 """
 
 
